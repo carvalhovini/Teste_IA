@@ -1,0 +1,259 @@
+import pygame
+import numpy as np
+import random
+import tensorflow as tf
+from tensorflow import keras
+from collections import deque
+import threading
+
+# Define a classe Obstacle
+class Obstacle:
+    def __init__(self, x, y, width, height):
+        self.rect = pygame.Rect(x, y, width, height)
+
+# Define o ambiente do jogo
+class GameEnvironment:
+    def __init__(self):
+        pygame.init()
+        self.screen = pygame.display.set_mode((800, 600))
+        pygame.display.set_caption("IA Aprendendo a Jogar")
+        self.clock = pygame.time.Clock()
+        self.player = pygame.Rect(50, 300, 40, 40)
+        self.obstacles = self.generate_obstacles()
+        self.done = False
+        self.reward = 0
+        self.episode_data = []  # Armazena os dados de cada episódio
+
+        # Sensores virtuais
+        self.num_sensors = 5
+        self.sensor_width = 10
+        self.sensor_height = 20
+        self.sensors = [
+            pygame.Rect(self.player.right, self.player.centery - self.sensor_height // 2, self.sensor_width, self.sensor_height)
+            for _ in range(self.num_sensors)
+        ]
+
+        # Sensores de distância (mais distantes)
+        self.distance_sensors = [
+            pygame.Rect(self.player.right, self.player.centery - self.sensor_height // 2, 1500, 2),
+            pygame.Rect(self.player.right, self.player.centery - self.sensor_height // 2 - 30, 1500, 2),
+            pygame.Rect(self.player.right, self.player.centery - self.sensor_height // 2 + 30, 1500, 2),
+        ]
+
+        # Normalização de estado
+        self.max_player_y = 600
+        self.max_obstacle_x = 1200
+
+    def generate_obstacles(self):
+        obstacles = []
+        min_distance = 300  # Distância mínima entre obstáculos
+
+        x = 800  # Comece a gerar os obstáculos fora da tela
+        while x < 1200:  # Gere obstáculos até uma certa posição
+            gap_height = random.randint(150, 250)  # Altura do espaço entre os canos
+            top_obstacle_height = random.randint(50, 400)  # Altura do cano superior
+            bottom_obstacle_height = 600 - top_obstacle_height - gap_height  # Altura do cano inferior
+
+            top_obstacle = Obstacle(x, 0, 50, top_obstacle_height)
+            bottom_obstacle = Obstacle(x, 600 - bottom_obstacle_height, 50, bottom_obstacle_height)
+
+            obstacles.extend([top_obstacle, bottom_obstacle])
+            x += top_obstacle.rect.width + min_distance
+
+        return obstacles
+
+    def reset(self):
+        self.player = pygame.Rect(50, 300, 40, 40)
+        self.obstacles = self.generate_obstacles()
+        self.done = False
+        self.reward = 0
+        self.episode_data = []  # Limpa os dados do episódio anterior
+
+    def step(self, action):
+        if action == 0:  # Move para cima
+            self.player.y -= 10
+        elif action == 1:  # Move para baixo
+            self.player.y += 10
+
+        # Atualiza a posição dos sensores virtuais
+        for i, sensor in enumerate(self.sensors):
+            sensor.x = self.player.right
+            sensor.centery = self.player.centery - (i - self.num_sensors // 2) * (self.sensor_height + 10)  # Espaçamento entre sensores
+
+        # Atualiza a posição dos sensores de distância
+        for i, sensor in enumerate(self.distance_sensors):
+            sensor.x = self.player.right
+            sensor.centery = self.player.centery - (i - 1) * 30
+
+        # Detecta colisões dos sensores com obstáculos
+        sensor_collisions = [sensor.colliderect(obstacle.rect) for sensor in self.sensors for obstacle in self.obstacles]
+
+        if any(sensor_collisions):
+            self.reward = -10  # Penalize a IA por detectar uma colisão iminente
+            self.done = True
+
+        # Detecta distância até obstáculos com sensores de distância
+        distances = []
+        for sensor in self.distance_sensors:
+            min_distance = float('inf')
+            for obstacle in self.obstacles:
+                if sensor.colliderect(obstacle.rect):
+                    distance = obstacle.rect.x - self.player.right
+                    if distance < min_distance:
+                        min_distance = distance
+            distances.append(min_distance)
+
+        # Detectar colisão com obstáculos
+        for obstacle in self.obstacles:
+            if self.player.colliderect(obstacle.rect):
+                self.reward = -10  # Penalize a IA por colidir com um obstáculo
+                self.done = True
+
+        # Mover os obstáculos
+        for obstacle in self.obstacles:
+            obstacle.rect.x -= 5
+            if obstacle.rect.right < 0:
+                # Remova os obstáculos que saíram da tela e gere novos
+                self.obstacles.remove(obstacle)
+                gap_height = random.randint(150, 250)
+                top_obstacle_height = random.randint(50, 400)
+                bottom_obstacle_height = 600 - top_obstacle_height - gap_height
+
+                new_top_obstacle = Obstacle(800, 0, 50, top_obstacle_height)
+                new_bottom_obstacle = Obstacle(800, 600 - bottom_obstacle_height, 50, bottom_obstacle_height)
+                self.obstacles.extend([new_top_obstacle, new_bottom_obstacle])
+
+        # Armazene os dados do episódio atual
+        self.episode_data.append((self.get_normalized_state(), action, self.reward, self.get_normalized_state(), self.done))
+
+        # Recompensas positivas para manter a IA viva
+        self.reward += 1
+
+    def get_normalized_state(self):
+        player_y = self.player.y / 600.0  # Normaliza a posição do jogador entre 0 e 1
+        obstacle_data = []
+
+        # Normaliza a posição dos obstáculos
+        for obstacle in self.obstacles:
+            obstacle_x = obstacle.rect.x / 800.0  # Normaliza a posição do obstáculo entre 0 e 1
+            obstacle_y = obstacle.rect.y / 600.0  # Normaliza a posição do obstáculo entre 0 e 1
+            obstacle_data.extend([obstacle_x, obstacle_y])
+
+        # Preencha o estado com zeros para garantir que ele tenha o tamanho correto (11)
+        while len(obstacle_data) < 10:
+            obstacle_data.append(0.0)
+
+        return [player_y] + obstacle_data
+
+# Certifique-se de que o tamanho do estado corresponde a 11
+state_size = 11  # Tamanho do estado
+
+# Certifique-se de que os estados estejam corretos ao chamar a função
+env = GameEnvironment()
+state = env.get_normalized_state()
+
+def normalize_state(self, state):
+    normalized_state = [
+        state[0] / self.max_player_y,  # Normaliza a posição do jogador
+    ]
+    for i in range(1, len(state), 2):
+        normalized_state.append(state[i] / self.max_obstacle_x)  # Normaliza as posições X dos obstáculos
+        normalized_state.append(state[i + 1] / self.max_player_y)  # Normaliza as posições Y dos obstáculos
+    return normalized_state
+
+# Crie a IA de aprendizado por reforço com memória de replay
+class QLearningAgent:
+    def __init__(self, state_size, action_size):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.epsilon = 1.0
+        self.epsilon_decay = 0.995
+        self.epsilon_min = 0.01
+        self.learning_rate = 0.01
+        self.gamma = 0.99
+        self.model = self.build_model()
+        self.memory = deque(maxlen=5000)
+
+    def build_model(self):
+        model = keras.Sequential()
+        model.add(keras.layers.Dense(32, input_dim=self.state_size, activation='relu'))
+        model.add(keras.layers.Dense(32, activation='relu'))
+        model.add(keras.layers.Dense(self.action_size, activation='linear'))
+        model.compile(loss='mse', optimizer=keras.optimizers.Adam(learning_rate=self.learning_rate))
+        return model
+
+    def choose_action(self, state):
+        if np.random.rand() <= self.epsilon:
+            return random.randrange(self.action_size)
+        q_values = self.model.predict(np.array([state]))[0]
+        return np.argmax(q_values)
+
+    def train(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
+        if len(self.memory) > 128:  # Treine com lotes de 128 amostras
+            batch = random.sample(self.memory, 128)
+            for state, action, reward, next_state, done in batch:
+                target = reward
+                if not done:
+                    target = reward + self.gamma * np.amax(self.model.predict(np.array([next_state]))[0])
+                target_f = self.model.predict(np.array([state]))
+                target_f[0][action] = target
+                self.model.fit(np.array([state]), target_f, epochs=1, verbose=0)
+            if self.epsilon > self.epsilon_min:
+                self.epsilon *= self.epsilon_decay
+
+# Função para renderizar o jogo usando o Pygame
+def render_game(env):
+    env.screen.fill((0, 0, 0))
+    pygame.draw.rect(env.screen, (255, 0, 0), env.player)
+    for obstacle in env.obstacles:
+        pygame.draw.rect(env.screen, (0, 255, 0), obstacle.rect)
+    for sensor in env.sensors:
+        pygame.draw.rect(env.screen, (0, 0, 255), sensor, 2)  # Desenhe os sensores em azul
+    for sensor in env.distance_sensors:
+        pygame.draw.rect(env.screen, (255, 255, 0), sensor, 2)  # Desenhe os sensores de distância em amarelo
+    pygame.display.flip()
+
+# Função para rodar o jogo em uma thread separada
+def game_thread(env):
+    while True:
+        if env.done:
+            env.reset()
+        action = agent.choose_action(env.get_normalized_state())
+        env.step(action)
+        render_game(env)
+        pygame.time.delay(10)  # Adiciona um pequeno atraso para evitar travamentos
+
+# Treine a IA em uma thread separada
+def train_agent(agent):
+    for episode in range(1000):
+        state = env.get_normalized_state()
+        total_reward = 0
+        env.reset()
+
+        while not env.done:
+            action = agent.choose_action(state)
+            env.step(action)
+            next_state = env.get_normalized_state()
+            reward = env.reward
+            agent.train(state, action, reward, next_state, env.done)
+            state = next_state
+            total_reward += reward
+
+        agent.memory.extend(env.episode_data)
+
+        print(f"Episódio: {episode + 1}, Recompensa Total: {total_reward}, Epsilon: {agent.epsilon}")
+
+if __name__ == "__main__":
+    env = GameEnvironment()
+    state_size = 11
+    action_size = 2
+    agent = QLearningAgent(state_size, action_size)
+
+    # Inicie o jogo em uma thread separada
+    game_thread = threading.Thread(target=game_thread, args=(env,))
+    game_thread.start()
+
+    # Treine a IA em outra thread separada
+    train_agent = threading.Thread(target=train_agent, args=(agent,))
+    train_agent.start()
